@@ -6,7 +6,9 @@
 #include <array>
 #include <cstddef> // size_t
 #include <map>
+#include <random>
 #include <set>
+#include <vector>
 
 #define LIBTRANSMISSION_PEER_MODULE
 
@@ -23,13 +25,16 @@ class PeerMgrWishlistTest : public ::tr::test::TransmissionTest
 protected:
     struct MockMediator final : public Wishlist::Mediator
     {
-        mutable std::map<tr_block_index_t, uint8_t> active_request_count_;
         mutable std::map<tr_piece_index_t, tr_block_span_t> block_span_;
         mutable std::map<tr_piece_index_t, tr_priority_t> piece_priority_;
         mutable std::map<tr_piece_index_t, size_t> piece_replication_;
         mutable std::set<tr_block_index_t> client_has_block_;
         mutable std::set<tr_piece_index_t> client_has_piece_;
         mutable std::set<tr_piece_index_t> client_wants_piece_;
+        // count_active_requests() scans these the way the real mediator scans
+        // connected peers.
+        mutable std::vector<tr_bitfield> peer_requests_;
+        bool is_endgame_ = false;
         bool is_sequential_download_ = false;
         tr_piece_index_t sequential_download_from_piece_ = 0;
 
@@ -48,6 +53,24 @@ protected:
         [[nodiscard]] bool client_wants_piece(tr_piece_index_t piece) const override
         {
             return client_wants_piece_.contains(piece);
+        }
+
+        [[nodiscard]] bool is_endgame() const override
+        {
+            return is_endgame_;
+        }
+
+        [[nodiscard]] uint8_t count_active_requests(tr_block_index_t block) const override
+        {
+            auto count = uint8_t{};
+            for (auto const& requests : peer_requests_)
+            {
+                if (requests.test(block) && ++count >= 2U)
+                {
+                    break;
+                }
+            }
+            return count;
         }
 
         [[nodiscard]] bool is_sequential_download() const override
@@ -218,6 +241,324 @@ TEST_F(PeerMgrWishlistTest, doesNotRequestSameBlockTwice)
     EXPECT_EQ(240U, requested.count());
     EXPECT_EQ(0U, requested.count(0, 10));
     EXPECT_EQ(240U, requested.count(10, 250));
+}
+
+TEST_F(PeerMgrWishlistTest, endgameRequestsEachInFlightBlockFromOnlyOneAdditionalPeer)
+{
+    auto mediator = MockMediator{};
+    mediator.block_span_[0] = { .begin = 0, .end = 10 };
+    mediator.piece_replication_[0] = 2;
+    mediator.client_wants_piece_.insert(0);
+
+    // A second peer gets no work under normal selection here -- the slow-tail
+    // condition endgame exists for.
+    mediator.peer_requests_.emplace_back(tr_bitfield{ 10 });
+    mediator.peer_requests_[0].set_span(0, 10);
+
+    auto wishlist = Wishlist{ mediator };
+    wishlist.on_sent_request({ .begin = 0, .end = 10 });
+    EXPECT_TRUE(std::empty(wishlist.next(10, PeerHasAllPieces)));
+
+    // Peer 1 already has the first half itself (e.g. from an earlier
+    // backup), so it is only offered the second half.
+    mediator.is_endgame_ = true;
+    mediator.peer_requests_.emplace_back(tr_bitfield{ 10 });
+    mediator.peer_requests_[1].set_span(0, 5);
+    static auto constexpr PeerHasFirstHalfInFlight = [](tr_block_index_t block)
+    {
+        return block < 5U;
+    };
+    auto spans = wishlist.next(10, PeerHasAllPieces, PeerHasFirstHalfInFlight);
+    auto requested = tr_bitfield{ 10 };
+    for (auto const& [begin, end] : spans)
+    {
+        requested.set_span(begin, end);
+    }
+    EXPECT_EQ(5U, requested.count());
+    EXPECT_EQ(0U, requested.count(0, 5));
+    EXPECT_EQ(5U, requested.count(5, 10));
+
+    // Peer 0 and peer 1 now both have all 10 blocks, so every block is at
+    // its two-requester cap and a third peer gets nothing.
+    mediator.peer_requests_[1].set_span(5, 10);
+    wishlist.on_sent_request({ .begin = 5, .end = 10 });
+    EXPECT_TRUE(std::empty(wishlist.next(10, PeerHasAllPieces)));
+
+    // Peer 1's request for block 5 is rejected. Peer 0 still holds it, so
+    // block 5 is a valid, capped endgame candidate again, not a free-for-all.
+    mediator.peer_requests_[1].unset(5);
+    wishlist.on_got_reject(5);
+    spans = wishlist.next(1, PeerHasAllPieces);
+    ASSERT_EQ(1U, std::size(spans));
+    EXPECT_EQ(5U, spans[0].begin);
+    EXPECT_EQ(6U, spans[0].end);
+
+    // Once peer 0 also lets go, block 5 has no requesters left; it is
+    // available the same way, this time through the plain unrequested path.
+    mediator.peer_requests_[0].unset(5);
+    wishlist.on_got_reject(5);
+    spans = wishlist.next(1, PeerHasAllPieces);
+    ASSERT_EQ(1U, std::size(spans));
+    EXPECT_EQ(5U, spans[0].begin);
+    EXPECT_EQ(6U, spans[0].end);
+}
+
+TEST_F(PeerMgrWishlistTest, endgameRejectDoesNotFreeABlockStillHeldByAnotherPeer)
+{
+    auto mediator = MockMediator{};
+    mediator.block_span_[0] = { .begin = 0, .end = 1 };
+    mediator.piece_replication_[0] = 2;
+    mediator.client_wants_piece_.insert(0);
+    mediator.is_endgame_ = true;
+
+    // Two peers already hold this block, capping it at two requesters. A
+    // reject or cancel of just one must not open the door to a third.
+    mediator.peer_requests_.emplace_back(tr_bitfield{ 1 });
+    mediator.peer_requests_.emplace_back(tr_bitfield{ 1 });
+    mediator.peer_requests_[0].set(0);
+    mediator.peer_requests_[1].set(0);
+
+    auto wishlist = Wishlist{ mediator };
+    wishlist.on_sent_request({ .begin = 0, .end = 1 });
+
+    // Real peers clear their own bit before notifying the wishlist (see
+    // tr_peerMsgsImpl::cancel_block_request and the reject handler in
+    // peer-msgs.cc); reproduce that ordering here.
+    mediator.peer_requests_[0].unset(0);
+    wishlist.on_got_reject(0);
+
+    // Peer 1 still holds the block, so this must return nothing even with
+    // endgame off -- a wrongly freed block would come back via the plain,
+    // uncapped unrequested path instead.
+    mediator.is_endgame_ = false;
+    EXPECT_TRUE(std::empty(wishlist.next(1, PeerHasAllPieces)));
+
+    // Once peer 1 also lets go, the block is free again.
+    mediator.peer_requests_[1].unset(0);
+    wishlist.on_sent_cancel(0);
+    EXPECT_FALSE(std::empty(wishlist.next(1, PeerHasAllPieces)));
+}
+
+TEST_F(PeerMgrWishlistTest, endgameGuardDoesNotDependOnEndgameStillBeingActive)
+{
+    auto mediator = MockMediator{};
+    mediator.block_span_[0] = { .begin = 0, .end = 1 };
+    mediator.piece_replication_[0] = 2;
+    mediator.client_wants_piece_.insert(0);
+    mediator.is_endgame_ = true;
+
+    mediator.peer_requests_.emplace_back(tr_bitfield{ 1 });
+    mediator.peer_requests_.emplace_back(tr_bitfield{ 1 });
+    mediator.peer_requests_[0].set(0);
+    mediator.peer_requests_[1].set(0);
+
+    auto wishlist = Wishlist{ mediator };
+    wishlist.on_sent_request({ .begin = 0, .end = 1 });
+
+    // The torrent leaves endgame (e.g. unrelated peer churn dropped total
+    // in-flight bytes below what's left to download) *before* peer 0's
+    // request ends, not after. The block still has a real second requester;
+    // whether the torrent as a whole currently reads as "in endgame" is a
+    // different question and must not decide this.
+    mediator.is_endgame_ = false;
+    mediator.peer_requests_[0].unset(0);
+    wishlist.on_got_reject(0);
+
+    EXPECT_TRUE(std::empty(wishlist.next(1, PeerHasAllPieces)));
+}
+
+TEST_F(PeerMgrWishlistTest, cancelForAnAlreadyDeliveredBlockDoesNotReviveIt)
+{
+    auto mediator = MockMediator{};
+    mediator.block_span_[0] = { .begin = 0, .end = 1 };
+    mediator.piece_replication_[0] = 2;
+    mediator.client_wants_piece_.insert(0);
+    mediator.is_endgame_ = true;
+
+    // Two peers hold the block, an endgame duplicate.
+    mediator.peer_requests_.emplace_back(tr_bitfield{ 1 });
+    mediator.peer_requests_.emplace_back(tr_bitfield{ 1 });
+    mediator.peer_requests_[0].set(0);
+    mediator.peer_requests_[1].set(0);
+
+    auto wishlist = Wishlist{ mediator };
+    wishlist.on_sent_request({ .begin = 0, .end = 1 });
+
+    // Peer 0 delivers the block first.
+    mediator.peer_requests_[0].unset(0);
+    mediator.client_has_block_.insert(0);
+    wishlist.on_got_block(0);
+
+    // Peer 1's now-redundant request gets cancelled. Neither peer holds the
+    // block anymore, but the client already has it -- it must not go back
+    // into the pool for a third peer to redundantly re-fetch.
+    mediator.peer_requests_[1].unset(0);
+    wishlist.on_sent_cancel(0);
+
+    EXPECT_TRUE(std::empty(wishlist.next(1, PeerHasAllPieces)));
+}
+
+TEST_F(PeerMgrWishlistTest, endgameChokeDoesNotFreeABlockStillHeldByAnotherPeer)
+{
+    auto mediator = MockMediator{};
+    mediator.block_span_[0] = { .begin = 0, .end = 1 };
+    mediator.piece_replication_[0] = 2;
+    mediator.client_wants_piece_.insert(0);
+    mediator.is_endgame_ = true;
+
+    mediator.peer_requests_.emplace_back(tr_bitfield{ 1 });
+    mediator.peer_requests_.emplace_back(tr_bitfield{ 1 });
+    mediator.peer_requests_[0].set(0);
+    mediator.peer_requests_[1].set(0);
+
+    auto wishlist = Wishlist{ mediator };
+    wishlist.on_sent_request({ .begin = 0, .end = 1 });
+
+    // Unlike a reject or cancel, a choking peer's own bit is still set when
+    // the wishlist is notified (tr_peerMsgsImpl clears it right after), so
+    // the guard must not count it as an extra peer.
+    auto const choked = mediator.peer_requests_[0];
+    wishlist.on_got_choke(choked);
+    mediator.peer_requests_[0].unset(0);
+
+    // Peer 1 still holds the block, even with endgame now off.
+    mediator.is_endgame_ = false;
+    EXPECT_TRUE(std::empty(wishlist.next(1, PeerHasAllPieces)));
+
+    // Peer 1 disconnects next, with the same still-set-at-call-time ordering.
+    mediator.is_endgame_ = true;
+    auto const disconnected = mediator.peer_requests_[1];
+    wishlist.on_peer_disconnect(tr_bitfield{ 300 }, disconnected);
+    mediator.peer_requests_[1].unset(0);
+
+    mediator.is_endgame_ = false;
+    EXPECT_FALSE(std::empty(wishlist.next(1, PeerHasAllPieces)));
+}
+
+TEST_F(PeerMgrWishlistTest, endgameStateMatchesActiveRequestsThroughRandomEvents)
+{
+    auto constexpr BlockCount = tr_block_index_t{ 64 };
+    auto constexpr PeerCount = size_t{ 8 };
+    auto constexpr QueueSize = size_t{ 4 };
+
+    auto mediator = MockMediator{};
+    mediator.block_span_[0] = { .begin = 0, .end = BlockCount };
+    mediator.piece_replication_[0] = PeerCount;
+    mediator.client_wants_piece_.insert(0);
+    mediator.is_endgame_ = true;
+    mediator.peer_requests_ = std::vector<tr_bitfield>(PeerCount, tr_bitfield{ BlockCount });
+
+    auto wishlist = Wishlist{ mediator };
+    auto is_available = std::vector<bool>(BlockCount);
+    auto is_complete = std::vector<bool>(BlockCount);
+
+    // The wishlist gets the same sent-request notification the peer manager
+    // would send in production.
+    for (auto block = tr_block_index_t{}; block < BlockCount; ++block)
+    {
+        mediator.peer_requests_[block % PeerCount].set(block);
+    }
+    wishlist.on_sent_request({ .begin = 0, .end = BlockCount });
+
+    auto const active_request_count = [&mediator](tr_block_index_t const block)
+    {
+        return std::count_if(
+            std::begin(mediator.peer_requests_),
+            std::end(mediator.peer_requests_),
+            [block](auto const& requests) { return requests.test(block); });
+    };
+
+    auto random = std::minstd_rand{ 0x8935U };
+    for (auto iteration = size_t{}; iteration < 1000U; ++iteration)
+    {
+        auto const peer = iteration % PeerCount;
+        auto const peer_has_active_request = [&mediator, peer](tr_block_index_t const block)
+        {
+            return mediator.peer_requests_[peer].test(block);
+        };
+
+        auto n_normal = size_t{};
+        auto n_endgame = size_t{};
+        for (auto block = tr_block_index_t{}; block < BlockCount; ++block)
+        {
+            if (is_complete[block] || peer_has_active_request(block))
+            {
+                continue;
+            }
+
+            if (is_available[block])
+            {
+                ++n_normal;
+            }
+            else if (active_request_count(block) < 2U)
+            {
+                ++n_endgame;
+            }
+        }
+
+        auto const expected = std::min(QueueSize, n_normal + n_endgame);
+        auto const spans = wishlist.next(QueueSize, PeerHasAllPieces, peer_has_active_request);
+        auto n_selected = size_t{};
+        for (auto const& [begin, end] : spans)
+        {
+            for (auto block = begin; block < end; ++block)
+            {
+                ASSERT_FALSE(is_complete[block]);
+                ASSERT_FALSE(peer_has_active_request(block));
+                ASSERT_TRUE(is_available[block] || active_request_count(block) < 2U);
+                mediator.peer_requests_[peer].set(block);
+                is_available[block] = false;
+                ++n_selected;
+            }
+            wishlist.on_sent_request({ .begin = begin, .end = end });
+        }
+        ASSERT_EQ(expected, n_selected);
+
+        // Releasing one of two requesters must leave the block off-limits to
+        // the plain unrequested pool as long as the other one remains.
+        auto const first = static_cast<tr_block_index_t>(random() % BlockCount);
+        auto block = first;
+        do
+        {
+            if (!is_complete[block] && active_request_count(block) >= 1U)
+            {
+                break;
+            }
+            block = (block + 1U) % BlockCount;
+        } while (block != first);
+
+        if (is_complete[block] || active_request_count(block) == 0U)
+        {
+            break;
+        }
+
+        auto const request_peer = std::find_if(
+            std::begin(mediator.peer_requests_),
+            std::end(mediator.peer_requests_),
+            [block](auto const& requests) { return requests.test(block); });
+        ASSERT_NE(std::end(mediator.peer_requests_), request_peer);
+        request_peer->unset(block);
+        auto const remaining = active_request_count(block);
+
+        switch (random() % 3U)
+        {
+        case 0U:
+            is_available[block] = remaining == 0U;
+            wishlist.on_got_reject(block);
+            break;
+
+        case 1U:
+            is_available[block] = remaining == 0U;
+            wishlist.on_sent_cancel(block);
+            break;
+
+        default:
+            is_complete[block] = true;
+            mediator.client_has_block_.insert(block);
+            wishlist.on_got_block(block);
+            break;
+        }
+    }
 }
 
 TEST_F(PeerMgrWishlistTest, sequentialDownload)
