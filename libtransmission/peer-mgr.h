@@ -704,7 +704,11 @@ constexpr bool tr_isPex(tr_pex const* pex)
 
 void tr_peerMgrFree(tr_peerMgr* manager);
 
-[[nodiscard]] std::vector<tr_block_span_t> tr_peerMgrGetNextRequests(tr_torrent* torrent, tr_peer const* peer, size_t numwant);
+[[nodiscard]] std::vector<tr_block_span_t> tr_peerMgrGetNextRequests(
+    tr_torrent* torrent,
+    tr_peer const* peer,
+    size_t numwant,
+    std::optional<tr_block_index_t> ignore_block = std::nullopt);
 
 void tr_peerMgrAddIncoming(tr_peerMgr* manager, std::shared_ptr<tr_peer_socket> socket);
 

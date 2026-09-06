@@ -606,7 +606,7 @@ private:
         desired_request_count_ = max_available_reqs();
     }
 
-    void maybe_send_block_requests();
+    void maybe_send_block_requests(std::optional<tr_block_index_t> ignore_block = std::nullopt);
 
     void check_request_timeout(time_t now);
 
@@ -1780,9 +1780,9 @@ ReadResult tr_peerMsgsImpl::process_peer_message(uint8_t id, MessageReader& payl
                 {
                     active_requests.unset(block);
 
-                    // Make sure maybe_send_block_requests() is called before removing the request
-                    // from the wishlist, so that it will choose a block other than the rejected block.
-                    maybe_send_block_requests();
+                    // Refill with this block explicitly excluded so the peer is not re-offered
+                    // its own rejected block before the rejection has been published to wishlist.
+                    maybe_send_block_requests(block);
 
                     publish(tr_peer_event::GotRejected(tor_.block_info(), block));
                 }
@@ -2054,7 +2054,7 @@ void tr_peerMsgsImpl::maybe_send_metadata_requests(time_t now) const
     }
 }
 
-void tr_peerMsgsImpl::maybe_send_block_requests()
+void tr_peerMsgsImpl::maybe_send_block_requests(std::optional<tr_block_index_t> const ignore_block)
 {
     if (!tor_.client_can_download() || !client_is_interested() || client_is_choked())
     {
@@ -2068,7 +2068,7 @@ void tr_peerMsgsImpl::maybe_send_block_requests()
     }
 
     auto const n_wanted = desired_request_count_ - n_active;
-    if (auto const requests = tr_peerMgrGetNextRequests(&tor_, this, n_wanted); !std::empty(requests))
+    if (auto const requests = tr_peerMgrGetNextRequests(&tor_, this, n_wanted, ignore_block); !std::empty(requests))
     {
         request_blocks(std::data(requests), std::size(requests));
     }

@@ -261,14 +261,17 @@ public:
 
     void on_rejection(tr_block_span_t block_span)
     {
+        // Clear the bit before publishing, matching tr_peerMsgsImpl: otherwise
+        // an endgame check running inside the handler below would still see
+        // this webseed as holding the block it just rejected.
         for (auto block = block_span.begin; block < block_span.end; ++block)
         {
             if (active_requests.test(block))
             {
+                active_requests.unset(block);
                 publish(tr_peer_event::GotRejected(tor.block_info(), block));
             }
         }
-        active_requests.unset_span(block_span.begin, block_span.end);
     }
 
     void request_blocks(tr_block_span_t const* block_spans, size_t n_spans) override

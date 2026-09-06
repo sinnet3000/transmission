@@ -384,16 +384,16 @@ TEST_F(PeerMgrWishlistTest, cancelForAnAlreadyDeliveredBlockDoesNotReviveIt)
     auto wishlist = Wishlist{ mediator };
     wishlist.on_sent_request({ .begin = 0, .end = 1 });
 
-    // Peer 0 delivers the block first.
+    // Peer 0 delivers the block first. Production cancels the redundant
+    // request before it tells the wishlist or torrent that the block arrived.
     mediator.peer_requests_[0].unset(0);
-    mediator.client_has_block_.insert(0);
-    wishlist.on_got_block(0);
-
-    // Peer 1's now-redundant request gets cancelled. Neither peer holds the
-    // block anymore, but the client already has it -- it must not go back
-    // into the pool for a third peer to redundantly re-fetch.
     mediator.peer_requests_[1].unset(0);
     wishlist.on_sent_cancel(0);
+
+    // The block is then recorded as received. It must not remain in the pool
+    // for a third peer to redundantly fetch.
+    mediator.client_has_block_.insert(0);
+    wishlist.on_got_block(0);
 
     EXPECT_TRUE(std::empty(wishlist.next(1, PeerHasAllPieces)));
 }

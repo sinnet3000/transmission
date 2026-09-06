@@ -457,23 +457,25 @@ public:
 
         [[nodiscard]] uint8_t count_active_requests(tr_block_index_t const block) const override
         {
-            auto n_requesters = uint8_t{};
-            auto const count_requests = [&n_requesters, block](auto const& peers)
+            // Do not duplicate requests for blocks already in flight to a webseed,
+            // as HTTP webseeds cannot receive CANCEL protocol messages.
+            for (auto const& webseed : swarm_.webseeds)
             {
-                for (auto const& peer : peers)
+                if (webseed->active_requests.test(block))
                 {
-                    if (peer->active_requests.test(block) && ++n_requesters >= 2U)
-                    {
-                        return;
-                    }
+                    return 2U;
                 }
-            };
-
-            count_requests(swarm_.peers);
-            if (n_requesters < 2U)
-            {
-                count_requests(swarm_.webseeds);
             }
+
+            auto n_requesters = uint8_t{};
+            for (auto const& peer : swarm_.peers)
+            {
+                if (peer->active_requests.test(block) && ++n_requesters >= 2U)
+                {
+                    return 2U;
+                }
+            }
+
             return n_requesters;
         }
 
@@ -1273,7 +1275,11 @@ void tr_peerMgrFree(tr_peerMgr* manager)
  *    tr_peerMgrGetNextRequests() is called.
  */
 
-std::vector<tr_block_span_t> tr_peerMgrGetNextRequests(tr_torrent* torrent, tr_peer const* peer, size_t numwant)
+std::vector<tr_block_span_t> tr_peerMgrGetNextRequests(
+    tr_torrent* torrent,
+    tr_peer const* peer,
+    size_t numwant,
+    std::optional<tr_block_index_t> const ignore_block)
 {
     TR_ASSERT(!torrent->is_done());
 
@@ -1282,7 +1288,8 @@ std::vector<tr_block_span_t> tr_peerMgrGetNextRequests(tr_torrent* torrent, tr_p
         return controller->next(
             numwant,
             [peer](tr_piece_index_t p) { return peer->has_piece(p); },
-            [peer](tr_block_index_t b) { return peer->active_requests.test(b); });
+            [peer, ignore_block](tr_block_index_t b)
+            { return (ignore_block && *ignore_block == b) || peer->active_requests.test(b); });
     }
 
     return {};
